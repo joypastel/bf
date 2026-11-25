@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FTMS Treadmill Control Tester</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 20px auto; padding: 0 16px; background: #111; color: #eee; }
+    h2 { font-size: 1.2rem; margin-bottom: 12px; }
+    .card { background: #1e1e1e; border: 1px solid #333; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    button { padding: 12px; font-size: 0.95rem; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; background: #2b6cb0; color: #fff; }
+    button:disabled { background: #333; color: #777; cursor: not-allowed; }
+    button.warn { background: #c53030; }
+    button.ok { background: #2f855a; }
+    .metric { font-size: 1.4rem; font-weight: bold; color: #63b3ed; }
+    #log { background: #000; color: #0f0; font-family: monospace; font-size: 0.8rem; height: 180px; overflow-y: auto; padding: 10px; border-radius: 8px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>🏃 FTMS 양방향 제어 테스터</h2>
+
+  <div class="card">
+    <button id="btnConnect" class="ok" style="width:100%">1. 트레드밀 연결 (FTMS 0x1826)</button>
+    <p id="status" style="margin:8px 0 0; font-size:0.9rem; color:#aaa;">상태: 미연결</p>
+  </div>
+
+  <div class="card grid">
+    <div>현재 속도<br><span id="curSpeed" class="metric">-</span> <small>mph</small></div>
+    <div>현재 경사<br><span id="curIncline" class="metric">-</span> <small>%</small></div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:8px; font-size:0.85rem; color:#bbb;">※ 먼저 트레드밀 콘솔의 START 버튼을 눌러 벨트를 움직이세요.</div>
+    <div class="grid">
+      <button id="btnReqCtrl" disabled>2. 제어 권한 요청</button>
+      <button id="btnStart" disabled>시작/재개 (0x07)</button>
+      <button id="btnSpeed15" disabled>속도 → 1.5 mph</button>
+      <button id="btnSpeed30" disabled>속도 → 3.0 mph</button>
+      <button id="btnInc0" disabled>경사 → 0.0 %</button>
+      <button id="btnInc3" disabled>경사 → 3.0 %</button>
+      <button id="btnPause" class="warn" disabled>일시정지 (0x08)</button>
+      <button id="btnStop" class="warn" disabled>정지 (0x08)</button>
+    </div>
+  </div>
+
+  <div id="log">로그 대기 중...\n</div>
+
+<script>
+  const FTMS_SERVICE = 0x1826;
+  const TREADMILL_DATA = 0x2ACD;
+  const CONTROL_POINT = 0x2AD9;
+
+  let controlChar = null;
+  const logEl = document.getElementById('log');
+  const log = (msg) => {
+    const time = new Date().toLocaleTimeString();
+    logEl.textContent += `[${time}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  const setButtonsEnabled = (enabled) => {
+    ['btnReqCtrl', 'btnStart', 'btnSpeed15', 'btnSpeed30', 'btnInc0', 'btnInc3', 'btnPause', 'btnStop']
+      .forEach(id => document.getElementById(id).disabled = !enabled);
+  };
+
+  document.getElementById('btnConnect').addEventListener('click', async () => {
+    try {
+      log('블루투스 기기 스캔 시작...');
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [FTMS_SERVICE] }]
+      });
+      document.getElementById('status').textContent = `연결됨: ${device.name || 'Unknown FTMS'}`;
+      log(`기기 선택됨: ${device.name}`);
+
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(FTMS_SERVICE);
+
+      // 1) Treadmill Data 구독 (읽기)
+      const dataChar = await service.getCharacteristic(TREADMILL_DATA);
+      await dataChar.startNotifications();
+      dataChar.addEventListener('characteristicvaluechanged', (e) => {
+        const dv = e.target.value;
+        const flags = dv.getUint16(0, true);
+        let offset = 2;
+        // Bit 0 == 0 이면 Instantaneous Speed 존재 (단위: 0.01 km/h)
+        if ((flags & 0x01) === 0) {
+          const speedKmh = dv.getUint16(offset, true) * 0.01;
+          const speedMph = (speedKmh * 0.621371).toFixed(2);
+          document.getElementById('curSpeed').textContent = speedMph;
+          offset += 2;
+        }
+        // Bit 1 == 1 이면 Average Speed 존재
+        if (flags & 0x02) offset += 2;
+        // Bit 2 == 1 이면 Total Distance 존재 (3 bytes)
+        if (flags & 0x04) offset += 3;
+        // Bit 3 == 1 이면 Inclination (sint16, 0.1%) & Ramp Angle (sint16) 존재
+        if (flags & 0x08) {
+          const incline = (dv.getInt16(offset, true) * 0.1).toFixed(1);
+          document.getElementById('curIncline').textContent = incline;
+        }
+      });
+      log('Treadmill Data (0x2ACD) 구독 완료');
+
+      // 2) Control Point 연결 (쓰기)
+      try {
+        controlChar = await service.getCharacteristic(CONTROL_POINT);
+        await controlChar.startNotifications();
+        controlChar.addEventListener('characteristicvaluechanged', (e) => {
+          const res = new Uint8Array(e.target.value.buffer);
+          // 응답 포맷: [0x80, 요청OpCode, 결과코드(0x01=성공, 0x02=미지원, 0x03=잘못된파라미터, 0x04=실패, 0x05=제어권한없음)]
+          const statusMap = { 1: '성공(0x01)', 2: '미지원 OpCode(0x02)', 3: '잘못된 파라미터(0x03)', 4: '동작 실패(0x04)', 5: '제어 권한 없음(0x05)' };
+          log(`Control 응답 -> OpCode: 0x${res[1]?.toString(16)}, 결과: ${statusMap[res[2]] || '0x' + res[2]?.toString(16)}`);
+        });
+        log('Control Point (0x2AD9) 발견 및 응답 구독 완료!');
+        setButtonsEnabled(true);
+      } catch (err) {
+        log('⚠️ 경고: Control Point (0x2AD9) 없음 또는 접근 불가 -> 읽기 전용 기기일 가능성 높음');
+      }
+    } catch (error) {
+      log(`오류: ${error.message}`);
+    }
+  });
+
+  async function sendCommand(bytes, desc) {
+    if (!controlChar) return;
+    try {
+      log(`전송 [${desc}]: ${Array.from(bytes).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ')}`);
+      await controlChar.writeValueWithResponse(new Uint8Array(bytes));
+    } catch (err) {
+      log(`전송 실패 [${desc}]: ${err.message}`);
+    }
+  }
+
+  // OpCode 0x00: Request Control
+  document.getElementById('btnReqCtrl').onclick = () => sendCommand([0x00], '제어 권한 요청');
+
+  // OpCode 0x07: Start or Resume
+  document.getElementById('btnStart').onclick = () => sendCommand([0x07], '시작/재개');
+
+  // OpCode 0x02: Set Target Speed (uint16, 0.01 km/h 단위, Little Endian)
+  // 1.5 mph ≈ 2.41 km/h -> 241 (0x00F1) -> [0x02, 0xF1, 0x00]
+  // 3.0 mph ≈ 4.83 km/h -> 483 (0x01E3) -> [0x02, 0xE3, 0x01]
+  document.getElementById('btnSpeed15').onclick = () => sendCommand([0x02, 0xF1, 0x00], '속도 1.5 mph (2.41 km/h)');
+  document.getElementById('btnSpeed30').onclick = () => sendCommand([0x02, 0xE3, 0x01], '속도 3.0 mph (4.83 km/h)');
+
+  // OpCode 0x03: Set Target Inclination (sint16, 0.1% 단위, Little Endian)
+  // 0.0% -> 0 (0x0000) -> [0x03, 0x00, 0x00]
+  // 3.0% -> 30 (0x001E) -> [0x03, 0x1E, 0x00]
+  document.getElementById('btnInc0').onclick = () => sendCommand([0x03, 0x00, 0x00], '경사 0.0%');
+  document.getElementById('btnInc3').onclick = () => sendCommand([0x03, 0x1E, 0x00], '경사 3.0%');
+
+  // OpCode 0x08: Stop or Pause (0x01 = Stop, 0x02 = Pause)
+  document.getElementById('btnPause').onclick = () => sendCommand([0x08, 0x02], '일시정지');
+  document.getElementById('btnStop').onclick = () => sendCommand([0x08, 0x01], '정지');
+</script>
+</body>
+</html>
